@@ -10,10 +10,12 @@ import json
 import logging
 import re
 from collections import defaultdict
+
+from sqlglot.tokens import Token
 from typing import Dict, List, Optional, Set
 
 import sqlglot
-from sqlglot import Expression, ParseError, exp, parse_one
+from sqlglot import Expression, ParseError, exp, parse_one, TokenType
 from sqlglot.expressions import (
     Alias,
     Case,
@@ -94,9 +96,14 @@ def get_metric_expression(metric_name: str, metrics: Dict[str, OGMetricSchema]) 
             return sql.strip()
 
         try:
-            expression = sqlglot.parse_one(sql, dialect=metric["dialect"])
-            tokens = expression.find_all(exp.Column)
+            dialect = sqlglot.Dialect.get_or_raise(metric["dialect"])
+            tokens = replace_jinja_tokens(dialect.tokenize(sql))
+            result = dialect.parser().parse(tokens, sql)
+            expression = result[0] if result else None
+            if not expression:
+                raise ParseError(f"No expression was parsed from '{sql}'")
 
+            tokens = expression.find_all(exp.Column)
             for token in tokens:
                 if token.sql() in metrics:
                     parent_sql = get_metric_expression(token.sql(), metrics)
@@ -113,6 +120,45 @@ def get_metric_expression(metric_name: str, metrics: Dict[str, OGMetricSchema]) 
 
     sorted_metric = dict(sorted(metric.items()))
     raise Exception(f"Unable to generate metric expression from: {sorted_metric}")
+
+
+def merge_tokens(token1: Token, token2: Token, token_type: TokenType) -> Token:
+    """
+    Merge two tokens
+    """
+    merged_token = token1
+    merged_token.text += token2.text
+    merged_token.token_type = token_type
+    return merged_token
+
+
+def replace_jinja_tokens(tokens: List[Token]) -> List[Token]:
+    """
+    Replaces Jinja-style `{{` and `}}` as block start/end.
+    Args:
+        tokens (List[Token]): List of tokens to process.
+    Returns:
+        List[Token]: List of tokens with Jinja blocks replaced.
+    """
+
+    merged_tokens = []
+    i = 0
+
+    while i < len(tokens):
+        if i < len(tokens) - 1:
+            if tokens[i].token_type == TokenType.L_BRACE and tokens[i + 1].token_type == TokenType.L_BRACE:
+                merged_tokens.append(merge_tokens(tokens[i], tokens[i + 1], TokenType.BLOCK_START))
+                i += 2
+                continue
+            elif tokens[i].token_type == TokenType.R_BRACE and tokens[i + 1].token_type == TokenType.R_BRACE:
+                merged_tokens.append(merge_tokens(tokens[i], tokens[i + 1], TokenType.BLOCK_END))
+                i += 2
+                continue
+
+        merged_tokens.append(tokens[i])
+        i += 1
+
+    return merged_tokens
 
 
 def apply_filters(sql: str, filters: List[FilterSchema]) -> str:
@@ -300,8 +346,8 @@ def convert_query_to_projection(sql: str, dialect: MFSQLEngine) -> str:
     )
 
     # replace aliases with their original expressions
-    for node, _, _ in metric_expression.walk():
-        if isinstance(node, Identifier) and node.sql() in aliases:
+    for node in metric_expression.find_all(Identifier):
+        if node.sql() in aliases:
             node.replace(parse_one(aliases[node.sql()]))
 
     # convert WHERE predicate to a CASE statement
@@ -310,13 +356,12 @@ def convert_query_to_projection(sql: str, dialect: MFSQLEngine) -> str:
 
         # Remove DISTINCT from metric to avoid conficting with CASE
         distinct = False
-        for node, _, _ in metric_expression.this.walk():
-            if isinstance(node, Distinct):
-                distinct = True
-                node.replace(node.expressions[0])
+        for node in metric_expression.find_all(Distinct):
+            distinct = True
+            node.replace(node.expressions[0])
 
-        for node, _, _ in where_expression.walk():
-            if isinstance(node, Identifier) and node.sql() in aliases:
+        for node in where_expression.find_all(Identifier):
+            if node.sql() in aliases:
                 node.replace(parse_one(aliases[node.sql()]))
 
         case_expression = Case(
